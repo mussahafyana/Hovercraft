@@ -1,14 +1,3 @@
-/*
-  Hovercraft Control: "The Navigator" (PURE C VERSION)
-  TURN UPGRADE v22: Front bumper compensation. A 7cm shock-absorbing bumper now sticks out
-  front (sensor unchanged), so the craft's effective front edge is 7cm closer to the wall than
-  the sensor reads. Wall thresholds raised to stop/turn before the bumper loads against the wall:
-  SLOW_CM 45->52, TURN_CM 28->37 (+7 +2 margin), STUCK_CM 32->39.
-  Keeps: post-turn SETTLE deflation, #1 PD turn, #PD anti-ram approach, #2 stuck-escape,
-  90deg symmetric turns, servo mirror, PI straight-line steering, INT0 ultrasonic.
-
-  NOTE: constants marked <<< TUNE use baseline values. If you hand-tuned them, restore yours.
-*/
 
 #define F_CPU 16000000UL
 
@@ -17,108 +6,106 @@
 #include <util/delay.h>
 #include <stdlib.h>
 
-// ---------- HARDWARE MAPPING (ATmega328P) ----------
+
 #define FAN_LIFT_PIN   PD5
 #define FAN_DIR_PIN    PD6
 #define LED_PIN        PB5
 #define SERVO_PIN      PB1
 
-// Logical-frame servo pulses. Servo physically rotated 180deg; output mirrored about center.
+
 const int SERVO_CENTER_US = 3150;
 const int SERVO_LEFT_US   = 1750;
 const int SERVO_RIGHT_US  = 4500;
 
-volatile int servoPulseWidth = SERVO_CENTER_US;
-int targetPulse = SERVO_CENTER_US;
+volatile int servoPos = SERVO_CENTER_US;
+int servoTarget = SERVO_CENTER_US;
 const int SERVO_SPEED = 150;
 
-volatile uint32_t timer0_millis = 0;
+volatile uint32_t millisCount = 0;
 
 #define MPU6050_ADDR 0x68
-const int FAN_DIR_FULL = 255;   // <<< TUNE: thrust ceiling (you may have capped this)
+const int FAN_DIR_FULL = 255;   
 const int FAN_LIFT_90  = 230;
 const int FAN_STOP = 0;
 
-// ===== turn tuning knobs =====
+
 const int FAN_LIFT_TURN      = 50;
 const uint32_t SCAN_SETTLE_MS = 200;
 const uint32_t SCAN_MAX_MS    = 1500;
 const uint32_t TURN_MAX_MS    = 3000;
 
-// --- post-turn SETTLE: brief hard deflation to let floor friction kill residual spin ---
 const int      FAN_LIFT_SETTLE = 30;
 const uint32_t SETTLE_MS       = 250;
 
-// --- two-stage wall trigger (RAISED for the 7cm front bumper) ---
-const int32_t SLOW_CM      = 50;    // was 45: +7 for the bumper (start slowing sooner)
-const int32_t TURN_CM      = 35;    // was 28: +7 bumper +2 margin (commit before bumper loads up)
-const int     FAN_DIR_SLOW = 110;   // must stay BELOW FAN_DIR_FULL
 
-// --- #PD ANTI-RAM approach ---
-const int32_t Kd_speed   = 150;  // <<< TUNE: closing-rate brake gain
-const int     FAN_DIR_MIN = 85;  // brake floor (must stay below FAN_DIR_SLOW)
+const int32_t SLOW_CM      = 50;   
+const int32_t TURN_CM      = 35;    
+const int     FAN_DIR_SLOW = 110;   
 
-// --- #2 STUCK-AT-WALL escape ---
+
+const int32_t Kd_speed   = 150;  
+const int     FAN_DIR_MIN = 85;  
+
+
 const int32_t STUCK_CM      = 37;   // was 32: +7 to track the bumper geometry
 const int32_t STUCK_DELTA   = 3;
 const uint32_t STUCK_MS     = 900;
 
-// --- post-turn straighten ---
+//  post-turn straighten 
 const uint32_t STRAIGHTEN_MAX_MS = 500;
 
-// --- #1 PD TURN CONTROLLER gains ---
-const int32_t Kp_turn = 18;    // <<< TUNE: turn drive strength
-const int32_t Kd_turn = 90;    // <<< TUNE: turn rate-brake
-const int32_t TURN_DONE = 300; // within 3.00 deg of target = turn complete
-
-// --- steering gains (straight-line PI) ---
+// #1 PD TURN CONTROLLER gains 
+const int32_t Kp_turn = 18;   
+const int32_t Kd_turn = 90;    
+const int32_t TURN_DONE = 300; 
+// steering gains (straight-line PI) 
 const int32_t Kp = 30;
 const int32_t Ki          = 2;
 const int32_t I_CLAMP     = 8000;
 const int     I_OUT_CLAMP = 600;
-// =============================
+
 
 int32_t yaw = 0;
-int32_t gyroErrorZ = 0;
-uint32_t previousTime = 0, currentTime = 0;
-uint32_t settleStart = 0;
-uint32_t straightenStart = 0;
-uint32_t scanStart = 0;
-uint32_t turnStart = 0;
-uint32_t brakeStart = 0;
+int32_t gyroOffset = 0;
+uint32_t prevTime = 0, nowTime = 0;
+uint32_t settleTimer = 0;
+uint32_t straightTimer = 0;
+uint32_t scanTimer = 0;
+uint32_t turnTimer = 0;
+uint32_t brakeTimer = 0;
 
-int32_t yawIntegral = 0;
+int32_t yawSum = 0;
 
 // scan state
-int scanPhase = 0;
-uint8_t scanArmed = 0;
-int32_t leftOpen = 0, rightOpen = 0;
+int scanStep = 0;
+uint8_t scanWait = 0;
+int32_t leftDist = 0, rightDist = 0;
 
 // stuck-detect state
-uint32_t stuckStart = 0;
-int32_t  stuckRefDist = 0;
-uint8_t  stuckArmed = 0;
+uint32_t stuckTimer = 0;
+int32_t  stuckDist = 0;
+uint8_t  stuckCheck = 0;
 
 // PD turn: latest gyro rate shared in
-int32_t gz_scaled_global = 0;
+int32_t gyroRate = 0;
 
 // PD approach: closing-rate tracking
-int32_t prevFrontDist = 999;
-int32_t closingFilt = 0;
+int32_t lastFrontDist = 999;
+int32_t closingRate = 0;
 
-// ================= Ultrasonic via INT0 (PD2), non-blocking timing =================
-volatile uint32_t timer0_overflows = 0;
-volatile uint8_t  echoState = 0;
-volatile uint32_t echoStartUs = 0;
-volatile uint32_t echoWidthUs = 0;
-volatile uint8_t  echoReady = 0;
+// Ultrasonic via INT0 (PD2), non-blocking timing 
+volatile uint32_t timer0Ovf = 0;
+volatile uint8_t  echoStep = 0;
+volatile uint32_t echoStart = 0;
+volatile uint32_t echoTime = 0;
+volatile uint8_t  echoDone = 0;
 
 static inline uint32_t micros_now(void) {
     uint32_t ov;
     uint8_t  t;
     uint8_t  oldSREG = SREG;
     cli();
-    ov = timer0_overflows;
+    ov = timer0Ovf;
     t  = TCNT0;
     if ((TIFR0 & (1 << TOV0)) && t < 255) ov++;
     SREG = oldSREG;
@@ -126,20 +113,20 @@ static inline uint32_t micros_now(void) {
 }
 
 ISR(TIMER0_OVF_vect) {
-    timer0_millis++;
-    timer0_overflows++;
+    millisCount++;
+    timer0Ovf++;
 }
 
 ISR(INT0_vect) {
     uint32_t now = micros_now();
     if (PIND & (1 << PD2)) {
-        echoStartUs = now;
-        echoState = 2;
+        echoStart = now;
+        echoStep = 2;
     } else {
-        if (echoState == 2) {
-            echoWidthUs = now - echoStartUs;
-            echoReady = 1;
-            echoState = 0;
+        if (echoStep == 2) {
+            echoTime = now - echoStart;
+            echoDone = 1;
+            echoStep = 0;
         }
     }
 }
@@ -148,7 +135,7 @@ uint32_t get_millis() {
     uint32_t m;
     uint8_t oldSREG = SREG;
     cli();
-    m = timer0_millis;
+    m = millisCount;
     SREG = oldSREG;
     return m;
 }
@@ -160,22 +147,22 @@ void trig_pulse(void) {
 }
 
 int32_t us_sensor_get_distance(void) {
-    echoReady = 0;
-    echoState = 1;
+    echoDone = 0;
+    echoStep = 1;
     trig_pulse();
 
     uint16_t guard = 0;
-    while (!echoReady && guard < 30000) {
+    while (!echoDone && guard < 30000) {
         _delay_us(1);
         guard++;
     }
-    if (!echoReady) { echoState = 0; return 0; }
+    if (!echoDone) { echoStep = 0; return 0; }
 
-    uint32_t w = echoWidthUs;
+    uint32_t w = echoTime;
     int32_t d = (int32_t)(w / 58UL);
     return d;
 }
-// ==================================================================================
+
 
 void UART_init(unsigned int ubrr) {
   UBRR0H = (unsigned char)(ubrr >> 8);
@@ -206,14 +193,14 @@ int16_t read_gyro_z_raw() {
 }
 
 void calculate_IMU_error() {
-  int32_t raw_sum = 0;
+  int32_t gyroSum = 0;
   for(int i=0; i<200; i++) {
-    raw_sum += read_gyro_z_raw();
+    gyroSum += read_gyro_z_raw();
     if(i % 10 == 0) PORTB ^= (1 << PB5);
     _delay_ms(10);
   }
-  int32_t raw_avg = raw_sum / 200;
-  gyroErrorZ = (raw_avg * 100) / 131;
+  int32_t gyroAvg = gyroSum / 200;
+  gyroOffset = (gyroAvg * 100) / 131;
   PORTB &= ~(1 << PB5);
 }
 
@@ -229,10 +216,10 @@ int32_t read_open(void) {
     return a + b + c - hi - lo;
 }
 
-// Servo physically rotated 180deg -> mirror commanded pulse about center before output.
-ISR(TIMER1_COMPA_vect){ OCR1A = 2 * SERVO_CENTER_US - servoPulseWidth; }
+// Servo physically rotated 180deg, mirror commanded pulse about center before output.
+ISR(TIMER1_COMPA_vect){ OCR1A = 2 * SERVO_CENTER_US - servoPos; }
 
-// ---------- States ----------
+//  States 
 enum SystemState {
   CRUISE       = 0,
   APPROACH     = 1,
@@ -243,8 +230,8 @@ enum SystemState {
 };
 SystemState systemState = CRUISE;
 
-int turnDirection = 1;
-int32_t targetYaw = 0;
+int turnDir = 1;
+int32_t yawTarget = 0;
 
 int main(void) {
     I2C_init();
@@ -266,7 +253,7 @@ int main(void) {
     TCCR1A=0; TCCR1B=0; TCNT1=0;
     ICR1=20000;
     OCR1A=SERVO_CENTER_US;
-    targetPulse = SERVO_CENTER_US;
+    servoTarget = SERVO_CENTER_US;
     TCCR1A=(1<<COM1A1)|(1<<WGM11);
     TCCR1B=(1<<WGM13)|(1<<WGM12)|(1<<CS11);
     TIMSK1|=(1<<OCIE1A);
@@ -280,28 +267,28 @@ int main(void) {
     OCR0B = FAN_LIFT_90; OCR0A = FAN_STOP; _delay_ms(1500);
     OCR0A = FAN_DIR_FULL;
 
-    previousTime = get_millis();
-    currentTime = previousTime;
+    prevTime = get_millis();
+    nowTime = prevTime;
 
     while(1) {
-        int16_t gz_raw = read_gyro_z_raw();
-        int32_t gz_scaled = ((int32_t)gz_raw * 100) / 131;
-        gz_scaled_global = gz_scaled;
+        int16_t gyroRaw = read_gyro_z_raw();
+        int32_t gyroNow = ((int32_t)gyroRaw * 100) / 131;
+        gyroRate = gyroNow;
 
-        previousTime = currentTime;
-        currentTime = get_millis();
-        uint32_t delta_t = (currentTime >= previousTime) ? (currentTime - previousTime) : 0;
+        prevTime = nowTime;
+        nowTime = get_millis();
+        uint32_t dt = (nowTime >= prevTime) ? (nowTime - prevTime) : 0;
 
-        yaw += ((gz_scaled - gyroErrorZ) * (int32_t)delta_t) / 1000;
+        yaw += ((gyroNow - gyroOffset) * (int32_t)dt) / 1000;
 
-        int32_t frontDist = us_sensor_get_distance();
+        int32_t frontCm = us_sensor_get_distance();
 
-        int32_t closingRaw = 0;
-        if (frontDist > 0 && prevFrontDist > 0 && delta_t > 0) {
-            closingRaw = ((prevFrontDist - frontDist) * 1000L) / (int32_t)delta_t;
+        int32_t closingNow = 0;
+        if (frontCm > 0 && lastFrontDist > 0 && dt > 0) {
+            closingNow = ((lastFrontDist - frontCm) * 1000L) / (int32_t)dt;
         }
-        closingFilt = (closingFilt * 3 + closingRaw) / 4;
-        prevFrontDist = frontDist;
+        closingRate = (closingRate * 3 + closingNow) / 4;
+        lastFrontDist = frontCm;
 
         switch(systemState){
 
@@ -309,108 +296,108 @@ int main(void) {
                 OCR0A = FAN_DIR_FULL;
                 OCR0B = FAN_LIFT_90;
 
-                int32_t error = targetYaw - yaw;
+                int32_t error = yawTarget - yaw;
 
-                yawIntegral += (error * (int32_t)delta_t) / 1000;
-                if (yawIntegral >  I_CLAMP) yawIntegral =  I_CLAMP;
-                if (yawIntegral < -I_CLAMP) yawIntegral = -I_CLAMP;
+                yawSum += (error * (int32_t)dt) / 1000;
+                if (yawSum >  I_CLAMP) yawSum =  I_CLAMP;
+                if (yawSum < -I_CLAMP) yawSum = -I_CLAMP;
 
                 int pCorr = (int)((error * Kp) / 100);
-                int iCorr = (int)((yawIntegral * Ki) / 100);
+                int iCorr = (int)((yawSum * Ki) / 100);
                 if (iCorr >  I_OUT_CLAMP) iCorr =  I_OUT_CLAMP;
                 if (iCorr < -I_OUT_CLAMP) iCorr = -I_OUT_CLAMP;
 
-                int correction = pCorr + iCorr;
-                int newPulse = SERVO_CENTER_US + correction;
-                if (newPulse < SERVO_LEFT_US)  newPulse = SERVO_LEFT_US;
-                if (newPulse > SERVO_RIGHT_US) newPulse = SERVO_RIGHT_US;
-                targetPulse = newPulse;
+                int steerAdj = pCorr + iCorr;
+                int servoCmd = SERVO_CENTER_US + steerAdj;
+                if (servoCmd < SERVO_LEFT_US)  servoCmd = SERVO_LEFT_US;
+                if (servoCmd > SERVO_RIGHT_US) servoCmd = SERVO_RIGHT_US;
+                servoTarget = servoCmd;
 
-                static int32_t lastGoodDist = 999;
-                if (frontDist > 0) lastGoodDist = frontDist;
+                static int32_t lastDist = 999;
+                if (frontCm > 0) lastDist = frontCm;
 
-                uint8_t wallNear =
-                    (frontDist > 0 && frontDist < SLOW_CM) ||
-                    (frontDist == 0 && lastGoodDist < SLOW_CM);
+                uint8_t nearWall =
+                    (frontCm > 0 && frontCm < SLOW_CM) ||
+                    (frontCm == 0 && lastDist < SLOW_CM);
 
-                if (abs(servoPulseWidth - SERVO_CENTER_US) < 200 && wallNear) {
-                    lastGoodDist = 999;
-                    stuckArmed = 0;
+                if (abs(servoPos - SERVO_CENTER_US) < 200 && nearWall) {
+                    lastDist = 999;
+                    stuckCheck = 0;
                     systemState = APPROACH;
                 }
                 break;
             }
 
             case APPROACH: {
-                static int32_t lastGoodDist2 = 999;
-                if (frontDist > 0) lastGoodDist2 = frontDist;
+                static int32_t lastDist2 = 999;
+                if (frontCm > 0) lastDist2 = frontCm;
 
-                int32_t distForRamp = (frontDist > 0) ? frontDist : lastGoodDist2;
+                int32_t distUsed = (frontCm > 0) ? frontCm : lastDist2;
 
-                int32_t pThrust;
-                if (distForRamp >= SLOW_CM)      pThrust = FAN_DIR_FULL;
-                else if (distForRamp <= TURN_CM) pThrust = FAN_DIR_SLOW;
-                else pThrust = FAN_DIR_SLOW +
-                        ((int32_t)(FAN_DIR_FULL - FAN_DIR_SLOW) * (distForRamp - TURN_CM))
+                int32_t baseThrust;
+                if (distUsed >= SLOW_CM)      baseThrust = FAN_DIR_FULL;
+                else if (distUsed <= TURN_CM) baseThrust = FAN_DIR_SLOW;
+                else baseThrust = FAN_DIR_SLOW +
+                        ((int32_t)(FAN_DIR_FULL - FAN_DIR_SLOW) * (distUsed - TURN_CM))
                         / (SLOW_CM - TURN_CM);
 
-                int32_t dBrake = (closingFilt > 0) ? (Kd_speed * closingFilt) / 100 : 0;
+                int32_t brakeAdj = (closingRate > 0) ? (Kd_speed * closingRate) / 100 : 0;
 
-                int32_t cmdThrust = pThrust - dBrake;
-                if (cmdThrust > FAN_DIR_FULL) cmdThrust = FAN_DIR_FULL;
-                if (cmdThrust < FAN_DIR_MIN)  cmdThrust = FAN_DIR_MIN;
+                int32_t thrustCmd = baseThrust - brakeAdj;
+                if (thrustCmd > FAN_DIR_FULL) thrustCmd = FAN_DIR_FULL;
+                if (thrustCmd < FAN_DIR_MIN)  thrustCmd = FAN_DIR_MIN;
 
-                OCR0A = (uint8_t)cmdThrust;
+                OCR0A = (uint8_t)thrustCmd;
                 OCR0B = FAN_LIFT_90;
 
-                int32_t error = targetYaw - yaw;
-                yawIntegral += (error * (int32_t)delta_t) / 1000;
-                if (yawIntegral >  I_CLAMP) yawIntegral =  I_CLAMP;
-                if (yawIntegral < -I_CLAMP) yawIntegral = -I_CLAMP;
+                int32_t error = yawTarget - yaw;
+                yawSum += (error * (int32_t)dt) / 1000;
+                if (yawSum >  I_CLAMP) yawSum =  I_CLAMP;
+                if (yawSum < -I_CLAMP) yawSum = -I_CLAMP;
 
                 int pCorr = (int)((error * Kp) / 100);
-                int iCorr = (int)((yawIntegral * Ki) / 100);
+                int iCorr = (int)((yawSum * Ki) / 100);
                 if (iCorr >  I_OUT_CLAMP) iCorr =  I_OUT_CLAMP;
                 if (iCorr < -I_OUT_CLAMP) iCorr = -I_OUT_CLAMP;
 
-                int correction = pCorr + iCorr;
-                int newPulse = SERVO_CENTER_US + correction;
-                if (newPulse < SERVO_LEFT_US)  newPulse = SERVO_LEFT_US;
-                if (newPulse > SERVO_RIGHT_US) newPulse = SERVO_RIGHT_US;
-                targetPulse = newPulse;
+                int steerAdj = pCorr + iCorr;
+                int servoCmd = SERVO_CENTER_US + steerAdj;
+                if (servoCmd < SERVO_LEFT_US)  servoCmd = SERVO_LEFT_US;
+                if (servoCmd > SERVO_RIGHT_US) servoCmd = SERVO_RIGHT_US;
+                servoTarget = servoCmd;
 
                 uint8_t atWall =
-                    (frontDist > 0 && frontDist < TURN_CM) ||
-                    (frontDist == 0 && lastGoodDist2 < TURN_CM);
+                    (frontCm > 0 && frontCm < TURN_CM) ||
+                    (frontCm == 0 && lastDist2 < TURN_CM);
 
-                uint8_t closeBand =
-                    (frontDist > 0 && frontDist < STUCK_CM) ||
-                    (frontDist == 0 && lastGoodDist2 < STUCK_CM);
-                uint8_t forcedStuck = 0;
-                if (closeBand) {
-                    if (!stuckArmed) {
-                        stuckArmed = 1;
-                        stuckStart = get_millis();
-                        stuckRefDist = (frontDist > 0) ? frontDist : lastGoodDist2;
+                uint8_t stuckRange =
+                    (frontCm > 0 && frontCm < STUCK_CM) ||
+                    (frontCm == 0 && lastDist2 < STUCK_CM);
+                uint8_t stuckFlag = 0;
+                if (stuckRange) {
+                    if (!stuckCheck) {
+                        stuckCheck = 1;
+                        stuckTimer = get_millis();
+                        stuckDist = (frontCm > 0) ? frontCm : lastDist2;
                     } else {
-                        int32_t cur = (frontDist > 0) ? frontDist : lastGoodDist2;
-                        if (labs((long)(cur - stuckRefDist)) > STUCK_DELTA) {
-                            stuckStart = get_millis();
-                            stuckRefDist = cur;
-                        } else if (get_millis() - stuckStart >= STUCK_MS) {
-                            forcedStuck = 1;
+                        int32_t cur = (frontCm > 0) ? frontCm : lastDist2;
+                        if (labs((long)(cur - stuckDist)) > STUCK_DELTA) {
+                            stuckTimer = get_millis();
+                            stuckDist = cur;
+                        } else if (get_millis() - stuckTimer >= STUCK_MS) {
+                            stuckFlag = 1;
                         }
                     }
                 } else {
-                    stuckArmed = 0;
+                    stuckCheck = 0;
                 }
 
-                if (atWall || forcedStuck) {
-                    lastGoodDist2 = 999;
-                    stuckArmed = 0;
-                    scanPhase = 0;
-                    scanArmed = 0;
-                    scanStart = get_millis();
+                if (atWall || stuckFlag) {
+                    lastDist2 = 999;
+                    stuckCheck = 0;
+                    scanStep = 0;
+                    scanWait = 0;
+                    scanTimer = get_millis();
                     systemState = SCAN_SIDES;
                 }
                 break;
@@ -420,32 +407,32 @@ int main(void) {
                 OCR0A = FAN_STOP;
                 OCR0B = FAN_LIFT_TURN;
 
-                if (scanPhase == 0) {
-                    targetPulse = SERVO_LEFT_US;
-                    if (abs(servoPulseWidth - targetPulse) <= SERVO_SPEED ||
-                        (get_millis() - scanStart) >= SCAN_MAX_MS) {
-                        if (!scanArmed) { settleStart = get_millis(); scanArmed = 1; }
-                        else if (get_millis() - settleStart >= SCAN_SETTLE_MS) {
-                            leftOpen = read_open();
-                            scanPhase = 1; scanArmed = 0;
-                            scanStart = get_millis();
+                if (scanStep == 0) {
+                    servoTarget = SERVO_LEFT_US;
+                    if (abs(servoPos - servoTarget) <= SERVO_SPEED ||
+                        (get_millis() - scanTimer) >= SCAN_MAX_MS) {
+                        if (!scanWait) { settleTimer = get_millis(); scanWait = 1; }
+                        else if (get_millis() - settleTimer >= SCAN_SETTLE_MS) {
+                            leftDist = read_open();
+                            scanStep = 1; scanWait = 0;
+                            scanTimer = get_millis();
                         }
                     }
                 } else {
-                    targetPulse = SERVO_RIGHT_US;
-                    if (abs(servoPulseWidth - targetPulse) <= SERVO_SPEED ||
-                        (get_millis() - scanStart) >= SCAN_MAX_MS) {
-                        if (!scanArmed) { settleStart = get_millis(); scanArmed = 1; }
-                        else if (get_millis() - settleStart >= SCAN_SETTLE_MS) {
-                            rightOpen = read_open();
+                    servoTarget = SERVO_RIGHT_US;
+                    if (abs(servoPos - servoTarget) <= SERVO_SPEED ||
+                        (get_millis() - scanTimer) >= SCAN_MAX_MS) {
+                        if (!scanWait) { settleTimer = get_millis(); scanWait = 1; }
+                        else if (get_millis() - settleTimer >= SCAN_SETTLE_MS) {
+                            rightDist = read_open();
 
-                            if (leftOpen > rightOpen) turnDirection = -1;
-                            else                      turnDirection = 1;
+                            if (leftDist > rightDist) turnDir = -1;
+                            else                      turnDir = 1;
 
-                            targetYaw += (9000 * turnDirection);   // 9000 = 90.00 degrees
-                            targetPulse = SERVO_CENTER_US;
-                            scanArmed = 0;
-                            turnStart = get_millis();
+                            yawTarget += (9000 * turnDir);   // 9000 = 90.00 degrees
+                            servoTarget = SERVO_CENTER_US;
+                            scanWait = 0;
+                            turnTimer = get_millis();
                             systemState = EXECUTE_TURN;
                         }
                     }
@@ -456,34 +443,34 @@ int main(void) {
                 OCR0A = FAN_DIR_FULL;
                 OCR0B = FAN_LIFT_TURN;
 
-                int32_t remaining = targetYaw - yaw;
-                int32_t pTerm = (remaining * Kp_turn) / 100;
-                int32_t dTerm = (gz_scaled_global * Kd_turn) / 100;
+                int32_t yawLeft = yawTarget - yaw;
+                int32_t pTerm = (yawLeft * Kp_turn) / 100;
+                int32_t dTerm = (gyroRate * Kd_turn) / 100;
                 int32_t turnCmd = pTerm - dTerm;
 
-                int newPulse = SERVO_CENTER_US + (int)turnCmd;
-                if (newPulse < SERVO_LEFT_US)  newPulse = SERVO_LEFT_US;
-                if (newPulse > SERVO_RIGHT_US) newPulse = SERVO_RIGHT_US;
-                targetPulse = newPulse;
+                int servoCmd = SERVO_CENTER_US + (int)turnCmd;
+                if (servoCmd < SERVO_LEFT_US)  servoCmd = SERVO_LEFT_US;
+                if (servoCmd > SERVO_RIGHT_US) servoCmd = SERVO_RIGHT_US;
+                servoTarget = servoCmd;
 
-                if (labs((long)remaining) <= TURN_DONE ||
-                    (get_millis() - turnStart >= TURN_MAX_MS)) {
-                    yawIntegral = 0;
-                    brakeStart = get_millis();
+                if (labs((long)yawLeft) <= TURN_DONE ||
+                    (get_millis() - turnTimer >= TURN_MAX_MS)) {
+                    yawSum = 0;
+                    brakeTimer = get_millis();
                     systemState = SETTLE;
                 }
                 break;
             }
 
             case SETTLE:
-                // Turn just finished. Deflate HARD + cut thrust so floor friction kills leftover
-                // spin, then re-inflate and hand to STRAIGHTEN. Rudder centered.
+                // Turn just finished. Deflate hard and cut thrust so floor friction kills leftover
+                // spin, then reinflate and hand to straighten. Rudder centered.
                 OCR0A = FAN_STOP;
                 OCR0B = FAN_LIFT_SETTLE;
-                targetPulse = SERVO_CENTER_US;
-                if (get_millis() - brakeStart >= SETTLE_MS) {
+                servoTarget = SERVO_CENTER_US;
+                if (get_millis() - brakeTimer >= SETTLE_MS) {
                     OCR0B = FAN_LIFT_90;
-                    straightenStart = get_millis();
+                    straightTimer = get_millis();
                     systemState = STRAIGHTEN;
                 }
                 break;
@@ -492,39 +479,39 @@ int main(void) {
                 OCR0A = FAN_DIR_SLOW;
                 OCR0B = FAN_LIFT_90;
 
-                int32_t error = targetYaw - yaw;
+                int32_t error = yawTarget - yaw;
 
-                yawIntegral += (error * (int32_t)delta_t) / 1000;
-                if (yawIntegral >  I_CLAMP) yawIntegral =  I_CLAMP;
-                if (yawIntegral < -I_CLAMP) yawIntegral = -I_CLAMP;
+                yawSum += (error * (int32_t)dt) / 1000;
+                if (yawSum >  I_CLAMP) yawSum =  I_CLAMP;
+                if (yawSum < -I_CLAMP) yawSum = -I_CLAMP;
 
                 int pCorr = (int)((error * Kp) / 100);
-                int iCorr = (int)((yawIntegral * Ki) / 100);
+                int iCorr = (int)((yawSum * Ki) / 100);
                 if (iCorr >  I_OUT_CLAMP) iCorr =  I_OUT_CLAMP;
                 if (iCorr < -I_OUT_CLAMP) iCorr = -I_OUT_CLAMP;
 
-                int correction = pCorr + iCorr;
-                int newPulse = SERVO_CENTER_US + correction;
-                if (newPulse < SERVO_LEFT_US)  newPulse = SERVO_LEFT_US;
-                if (newPulse > SERVO_RIGHT_US) newPulse = SERVO_RIGHT_US;
-                targetPulse = newPulse;
+                int steerAdj = pCorr + iCorr;
+                int servoCmd = SERVO_CENTER_US + steerAdj;
+                if (servoCmd < SERVO_LEFT_US)  servoCmd = SERVO_LEFT_US;
+                if (servoCmd > SERVO_RIGHT_US) servoCmd = SERVO_RIGHT_US;
+                servoTarget = servoCmd;
 
-                if ((abs(servoPulseWidth - SERVO_CENTER_US) < 200) ||
-                    (get_millis() - straightenStart >= STRAIGHTEN_MAX_MS)) {
+                if ((abs(servoPos - SERVO_CENTER_US) < 200) ||
+                    (get_millis() - straightTimer >= STRAIGHTEN_MAX_MS)) {
                     systemState = CRUISE;
                 }
                 break;
             }
         }
 
-        int diff = targetPulse - servoPulseWidth;
+        int diff = servoTarget - servoPos;
         if (abs(diff) > SERVO_SPEED) {
-            if (diff > 0) servoPulseWidth += SERVO_SPEED;
-            else          servoPulseWidth -= SERVO_SPEED;
+            if (diff > 0) servoPos += SERVO_SPEED;
+            else          servoPos -= SERVO_SPEED;
         } else {
-            servoPulseWidth = targetPulse;
+            servoPos = servoTarget;
         }
-        OCR1A = 2 * SERVO_CENTER_US - servoPulseWidth;
+        OCR1A = 2 * SERVO_CENTER_US - servoPos;
 
         _delay_ms(40);
     }
